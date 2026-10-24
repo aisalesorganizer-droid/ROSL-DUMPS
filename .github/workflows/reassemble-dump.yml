@@ -23,83 +23,120 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y p7zip-full
 
-      - name: Verify parts and reassemble
+      - name: Verify archive and extract the original dump
         shell: bash
         run: |
-          set -uo pipefail
-          mkdir -p work
+          set -euo pipefail
+          mkdir -p work/extracted work/dump-parts
+
           {
             echo "Repository: aisalesorganizer-droid/ROSL-DUMPS"
             echo "Commit: $GITHUB_SHA"
             echo
             echo "PART SIZE AND SHA-256"
             for f in ros64.z01 ros64.z02 ros64.z03 ros64.z04 ros64.z05 ros64.z06 ros64.zip; do
-              if [[ ! -f "$f" ]]; then
-                echo "MISSING: $f"
-                exit 10
-              fi
+              test -f "$f" || { echo "MISSING: $f"; exit 10; }
               stat -c '%n %s bytes' "$f"
               sha256sum "$f"
             done
           } | tee work/parts-manifest.txt
 
-          echo "TESTING ORIGINAL MULTI-VOLUME ARCHIVE"
-          set +e
           7z t ros64.zip > work/original-volume-test.txt 2>&1
-          ORIGINAL_TEST_RC=$?
-          set -e
-          echo "$ORIGINAL_TEST_RC" > work/original-volume-test-exit.txt
           cat work/original-volume-test.txt
-
-          echo "LISTING ARCHIVE CONTENTS"
-          set +e
           7z l -slt ros64.zip > work/archive-listing.txt 2>&1
-          LIST_RC=$?
-          set -e
-          echo "$LIST_RC" > work/archive-listing-exit.txt
-          tail -n 100 work/archive-listing.txt
 
-          echo "CONCATENATING VOLUMES IN ORDER"
-          cat ros64.z01 ros64.z02 ros64.z03 ros64.z04 ros64.z05 ros64.z06 ros64.zip > work/ros64-reassembled.zip
-          stat -c 'Reassembled archive: %s bytes' work/ros64-reassembled.zip
-          sha256sum work/ros64-reassembled.zip | tee work/reassembled-sha256.txt
-
-          echo "TESTING CONCATENATED ARCHIVE"
-          set +e
-          7z t work/ros64-reassembled.zip > work/reassembled-test.txt 2>&1
-          COMBINED_TEST_RC=$?
-          set -e
-          echo "$COMBINED_TEST_RC" > work/reassembled-test-exit.txt
-          cat work/reassembled-test.txt
-
-          echo "EXTRACTING ORIGINAL MULTI-VOLUME ARCHIVE FOR INSPECTION"
-          mkdir -p work/extracted
-          set +e
           7z x ros64.zip -owork/extracted -y > work/extraction-test.txt 2>&1
-          EXTRACT_RC=$?
-          set -e
-          echo "$EXTRACT_RC" > work/extraction-test-exit.txt
           cat work/extraction-test.txt
-          find work/extracted -type f -printf '%p %s bytes\n' | tee work/extracted-files.txt
-          sha256sum work/extracted/* 2>/dev/null > work/extracted-sha256.txt || true
+          test -f work/extracted/ros64.dmp
+          test "$(stat -c %s work/extracted/ros64.dmp)" -gt 0
 
-      - name: Upload reassembled archive and verification reports
+          DUMP=work/extracted/ros64.dmp
+          sha256sum "$DUMP" | tee work/dump-sha256.txt
+          stat -c 'Extracted dump: %n %s bytes' "$DUMP" | tee work/dump-size.txt
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+
+          source = Path("work/extracted/ros64.dmp")
+          out = Path("work/dump-parts")
+          out.mkdir(parents=True, exist_ok=True)
+          chunk_size = 500_000_000
+          index = 0
+          with source.open("rb") as src:
+              while True:
+                  block = src.read(chunk_size)
+                  if not block:
+                      break
+                  target = out / f"ros64.dmp.part{index:02d}"
+                  target.write_bytes(block)
+                  digest = hashlib.sha256(block).hexdigest()
+                  print(f"{target} {len(block)} bytes sha256={digest}")
+                  index += 1
+          if index != 4:
+              raise SystemExit(f"Expected 4 parts for this dump size; got {index}")
+          original_size = source.stat().st_size
+          parts_size = sum(p.stat().st_size for p in sorted(out.glob("ros64.dmp.part*")))
+          if original_size != parts_size:
+              raise SystemExit(f"Size mismatch: original={original_size}, parts={parts_size}")
+          print(f"PARTITION_OK original={original_size} parts={parts_size} count={index}")
+          PY
+
+          {
+            echo "Original dump SHA-256:"
+            cat work/dump-sha256.txt
+            echo
+            echo "Original dump size:"
+            cat work/dump-size.txt
+            echo
+            echo "Parts:"
+            sha256sum work/dump-parts/ros64.dmp.part*
+            stat -c '%n %s bytes' work/dump-parts/ros64.dmp.part*
+          } > work/dump-parts-manifest.txt
+
+      - name: Upload dump part 00
         uses: actions/upload-artifact@v4
         with:
-          name: ros64-reassembly-20261024
+          name: ros64-dmp-part00
+          path: work/dump-parts/ros64.dmp.part00
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload dump part 01
+        uses: actions/upload-artifact@v4
+        with:
+          name: ros64-dmp-part01
+          path: work/dump-parts/ros64.dmp.part01
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload dump part 02
+        uses: actions/upload-artifact@v4
+        with:
+          name: ros64-dmp-part02
+          path: work/dump-parts/ros64.dmp.part02
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload dump part 03
+        uses: actions/upload-artifact@v4
+        with:
+          name: ros64-dmp-part03
+          path: work/dump-parts/ros64.dmp.part03
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload manifests and archive diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: ros64-dmp-manifests
           path: |
-            work/ros64-reassembled.zip
             work/parts-manifest.txt
             work/original-volume-test.txt
-            work/original-volume-test-exit.txt
             work/archive-listing.txt
-            work/archive-listing-exit.txt
-            work/reassembled-sha256.txt
-            work/reassembled-test.txt
-            work/reassembled-test-exit.txt
             work/extraction-test.txt
-            work/extraction-test-exit.txt
-            work/extracted-files.txt
-            work/extracted-sha256.txt
+            work/dump-sha256.txt
+            work/dump-size.txt
+            work/dump-parts-manifest.txt
           compression-level: 0
           if-no-files-found: error
