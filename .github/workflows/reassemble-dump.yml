@@ -1,0 +1,105 @@
+name: Temporary ROS64 dump reassembly
+
+on:
+  push:
+    branches:
+      - ai/reassemble-dump-20261024
+
+permissions:
+  contents: read
+
+jobs:
+  reassemble-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout split archive
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install archive verifier
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full
+
+      - name: Verify parts and reassemble
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p work
+          {
+            echo "Repository: aisalesorganizer-droid/ROSL-DUMPS"
+            echo "Commit: $GITHUB_SHA"
+            echo
+            echo "PART SIZE AND SHA-256"
+            for f in ros64.z01 ros64.z02 ros64.z03 ros64.z04 ros64.z05 ros64.z06 ros64.zip; do
+              if [[ ! -f "$f" ]]; then
+                echo "MISSING: $f"
+                exit 10
+              fi
+              stat -c '%n %s bytes' "$f"
+              sha256sum "$f"
+            done
+          } | tee work/parts-manifest.txt
+
+          echo "TESTING ORIGINAL MULTI-VOLUME ARCHIVE"
+          set +e
+          7z t ros64.zip > work/original-volume-test.txt 2>&1
+          ORIGINAL_TEST_RC=$?
+          set -e
+          echo "$ORIGINAL_TEST_RC" > work/original-volume-test-exit.txt
+          cat work/original-volume-test.txt
+
+          echo "LISTING ARCHIVE CONTENTS"
+          set +e
+          7z l -slt ros64.zip > work/archive-listing.txt 2>&1
+          LIST_RC=$?
+          set -e
+          echo "$LIST_RC" > work/archive-listing-exit.txt
+          tail -n 100 work/archive-listing.txt
+
+          echo "CONCATENATING VOLUMES IN ORDER"
+          cat ros64.z01 ros64.z02 ros64.z03 ros64.z04 ros64.z05 ros64.z06 ros64.zip > work/ros64-reassembled.zip
+          stat -c 'Reassembled archive: %s bytes' work/ros64-reassembled.zip
+          sha256sum work/ros64-reassembled.zip | tee work/reassembled-sha256.txt
+
+          echo "TESTING CONCATENATED ARCHIVE"
+          set +e
+          7z t work/ros64-reassembled.zip > work/reassembled-test.txt 2>&1
+          COMBINED_TEST_RC=$?
+          set -e
+          echo "$COMBINED_TEST_RC" > work/reassembled-test-exit.txt
+          cat work/reassembled-test.txt
+
+          echo "EXTRACTING ORIGINAL MULTI-VOLUME ARCHIVE FOR INSPECTION"
+          mkdir -p work/extracted
+          set +e
+          7z x ros64.zip -owork/extracted -y > work/extraction-test.txt 2>&1
+          EXTRACT_RC=$?
+          set -e
+          echo "$EXTRACT_RC" > work/extraction-test-exit.txt
+          cat work/extraction-test.txt
+          find work/extracted -type f -printf '%p %s bytes\n' | tee work/extracted-files.txt
+          sha256sum work/extracted/* 2>/dev/null > work/extracted-sha256.txt || true
+
+      - name: Upload reassembled archive and verification reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: ros64-reassembly-20261024
+          path: |
+            work/ros64-reassembled.zip
+            work/parts-manifest.txt
+            work/original-volume-test.txt
+            work/original-volume-test-exit.txt
+            work/archive-listing.txt
+            work/archive-listing-exit.txt
+            work/reassembled-sha256.txt
+            work/reassembled-test.txt
+            work/reassembled-test-exit.txt
+            work/extraction-test.txt
+            work/extraction-test-exit.txt
+            work/extracted-files.txt
+            work/extracted-sha256.txt
+          compression-level: 0
+          if-no-files-found: error
