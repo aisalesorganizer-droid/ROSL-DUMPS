@@ -23,7 +23,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y p7zip-full
 
-      - name: Verify archive and extract the original dump
+      - name: Verify archive, extract dump, and split it
         shell: bash
         run: |
           set -euo pipefail
@@ -57,7 +57,6 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           import hashlib
-
           source = Path("work/extracted/ros64.dmp")
           out = Path("work/dump-parts")
           out.mkdir(parents=True, exist_ok=True)
@@ -70,8 +69,7 @@ jobs:
                       break
                   target = out / f"ros64.dmp.part{index:02d}"
                   target.write_bytes(block)
-                  digest = hashlib.sha256(block).hexdigest()
-                  print(f"{target} {len(block)} bytes sha256={digest}")
+                  print(f"{target} {len(block)} bytes sha256={hashlib.sha256(block).hexdigest()}")
                   index += 1
           if index != 4:
               raise SystemExit(f"Expected 4 parts for this dump size; got {index}")
@@ -93,6 +91,225 @@ jobs:
             sha256sum work/dump-parts/ros64.dmp.part*
             stat -c '%n %s bytes' work/dump-parts/ros64.dmp.part*
           } > work/dump-parts-manifest.txt
+
+      - name: Inspect minidump and entity-discovery addresses
+        shell: bash
+        run: |
+          python3 - <<'PY' | tee work/entity-discovery-memory-report.txt
+          import bisect, struct, time
+          from pathlib import Path
+
+          path = Path("work/extracted/ros64.dmp")
+          size = path.stat().st_size
+          names = {
+              3: "ThreadList", 4: "ModuleList", 5: "MemoryList", 6: "Exception",
+              7: "SystemInfo", 8: "ThreadExList", 9: "Memory64List",
+              10: "CommentA", 11: "CommentW", 12: "HandleData",
+              13: "FunctionTable", 14: "UnloadedModuleList", 15: "MiscInfo",
+              16: "MemoryInfoList", 17: "ThreadInfoList", 18: "HandleOperationList",
+              19: "Token", 20: "JavaScriptData", 21: "SystemMemoryInfo",
+              22: "ProcessVmCounters", 23: "IptTrace"
+          }
+          regions = []
+
+          print("=== DUMP HEADER ===")
+          print(f"path={path} fileSize={size}")
+          with path.open("rb") as f:
+              header = f.read(32)
+              print(f"first32={header.hex(' ')}")
+              if len(header) != 32 or header[:4] != b"MDMP":
+                  print("FORMAT=NOT_WINDOWS_MINIDUMP_OR_HEADER_UNAVAILABLE")
+                  raise SystemExit(0)
+              version, count, directory_rva, checksum, timestamp, flags = struct.unpack_from("<IIIIIQ", header, 4)
+              print(f"signature=MDMP version=0x{version:X} streamCount={count} directoryRva=0x{directory_rva:X} checksum=0x{checksum:X} timestamp=0x{timestamp:X} flags=0x{flags:X}")
+              if count > 100000 or directory_rva + count * 12 > size:
+                  print("ERROR=invalid stream directory bounds")
+                  raise SystemExit(0)
+              streams = {}
+              for i in range(count):
+                  f.seek(directory_rva + i * 12)
+                  stype, data_size, rva = struct.unpack("<III", f.read(12))
+                  print(f"stream[{i}] type={stype} name={names.get(stype, 'Unknown')} size={data_size} rva=0x{rva:X}")
+                  if rva + data_size <= size:
+                      streams.setdefault(stype, []).append((data_size, rva))
+              # Memory64List is preferred because it provides contiguous raw-memory data.
+              if 9 in streams:
+                  data_size, rva = streams[9][0]
+                  f.seek(rva)
+                  raw = f.read(16)
+                  if len(raw) == 16:
+                      n, base_rva = struct.unpack("<QQ", raw)
+                      if n <= 2_000_000 and 16 + n * 16 <= data_size:
+                          f.seek(rva + 16)
+                          cursor = base_rva
+                          for _ in range(n):
+                              start, length = struct.unpack("<QQ", f.read(16))
+                              if start + length <= 0x10000000000000000 and cursor + length <= size:
+                                  regions.append((start, start + length, cursor, length))
+                              cursor += length
+                          print(f"MEMORY64 rangesDeclared={n} baseRva=0x{base_rva:X} validRanges={len(regions)}")
+              if not regions and 5 in streams:
+                  data_size, rva = streams[5][0]
+                  f.seek(rva)
+                  raw = f.read(4)
+                  if len(raw) == 4:
+                      n = struct.unpack("<I", raw)[0]
+                      if n <= 2_000_000 and 4 + n * 16 <= data_size:
+                          f.seek(rva + 4)
+                          for _ in range(n):
+                              start, length, mem_rva = struct.unpack("<QII", f.read(16))
+                              if mem_rva + length <= size:
+                                  regions.append((start, start + length, mem_rva, length))
+                          print(f"MEMORYLIST rangesDeclared={n} validRanges={len(regions)}")
+              if not regions:
+                  print("ERROR=no usable Memory64ListStream or MemoryListStream found")
+                  raise SystemExit(0)
+              regions.sort(key=lambda x: x[0])
+              starts = [r[0] for r in regions]
+              covered = sum(r[3] for r in regions)
+              print(f"memoryRanges={len(regions)} mappedBytes={covered} firstVA=0x{regions[0][0]:X} lastVAEnd=0x{regions[-1][1]:X}")
+
+              def read_va(va, n):
+                  idx = bisect.bisect_right(starts, va) - 1
+                  if idx < 0:
+                      return None
+                  start, end, file_offset, length = regions[idx]
+                  if va < start or va + n > end:
+                      return None
+                  f.seek(file_offset + (va - start))
+                  b = f.read(n)
+                  return b if len(b) == n else None
+
+              def q(va):
+                  b = read_va(va, 8)
+                  return struct.unpack("<Q", b)[0] if b else None
+
+              def d(va):
+                  b = read_va(va, 4)
+                  return struct.unpack("<I", b)[0] if b else None
+
+              def dump_qwords(label, va, count=8):
+                  print(f"-- {label} VA=0x{va:X} --")
+                  b = read_va(va, count * 8)
+                  if not b:
+                      print("UNMAPPED_OR_CROSSES_RANGE")
+                      return
+                  vals = struct.unpack("<" + "Q" * count, b)
+                  for i, val in enumerate(vals):
+                      addr = va + i * 8
+                      print(f"  +0x{i*8:03X} [0x{addr:X}] = 0x{val:016X} mappedTarget={'yes' if (val and read_va(val, 8)) else 'no'}")
+
+              def dump_bytes(label, va, n=0x40):
+                  print(f"-- {label} VA=0x{va:X} bytes={n} --")
+                  b = read_va(va, n)
+                  if b is None:
+                      print("UNMAPPED_OR_CROSSES_RANGE")
+                  else:
+                      for i in range(0, len(b), 16):
+                          chunk = b[i:i+16]
+                          print(f"  +0x{i:03X}: {chunk.hex(' ')}  {''.join(chr(x) if 32 <= x < 127 else '.' for x in chunk)}")
+
+              print("=== STATIC ENTITY MANAGER POINTER ===")
+              em_slot = 0x1431F53D8
+              dump_bytes("EM pointer slot", em_slot, 0x20)
+              em = q(em_slot)
+              print(f"emPointerSlotVA=0x{em_slot:X} value={('0x%X' % em) if em is not None else 'UNMAPPED'}")
+              if em is None or em == 0 or read_va(em, 8) is None:
+                  print("ENTITY_MANAGER_POINTER_NOT_MAPPED; no dependent pointer is treated as valid")
+                  raise SystemExit(0)
+
+              print("=== ENTITY MANAGER FIELDS ===")
+              dump_qwords("EntityManager+0x10D0", em + 0x10D0, 8)
+              tree_field = em + 0x10E0
+              tree_candidate = q(tree_field)
+              dump_qwords("EntityManager all-entities field bytes", tree_field, 8)
+              print(f"EM_ALL_ENTITIES_FIELD=0x{tree_field:X} firstQword={('0x%X' % tree_candidate) if tree_candidate is not None else 'UNMAPPED'}")
+              if tree_candidate and read_va(tree_candidate, 8):
+                  dump_qwords("All-entities candidate target", tree_candidate, 12)
+                  dump_bytes("All-entities candidate target bytes", tree_candidate, 0x80)
+
+              controlled_field = em + 0x10F8
+              controlled = q(controlled_field)
+              print(f"CONTROLLED_ENTITIES_FIELD=0x{controlled_field:X} value={('0x%X' % controlled) if controlled is not None else 'UNMAPPED'}")
+              dump_qwords("EntityManager controlledEntities field", controlled_field, 6)
+              if not controlled or read_va(controlled + 0x8, 8) is None:
+                  print("CONTROLLED_ENTITIES_CHAIN_NOT_MAPPED")
+                  raise SystemExit(0)
+
+              controlled_tree = q(controlled + 0x8)
+              print(f"CONTROLLED_TREE_CANDIDATE={('0x%X' % controlled_tree) if controlled_tree is not None else 'UNMAPPED'}")
+              if not controlled_tree or read_va(controlled_tree + 0x20, 8) is None:
+                  print("CONTROLLED_TREE_ROOT_NOT_MAPPED")
+                  raise SystemExit(0)
+              dump_qwords("Controlled-tree candidate", controlled_tree, 10)
+              local_avatar = q(controlled_tree + 0x20)
+              print(f"LOCAL_AVATAR_CANDIDATE={('0x%X' % local_avatar) if local_avatar is not None else 'UNMAPPED'}")
+              if not local_avatar or read_va(local_avatar + 0x1B0, 8) is None:
+                  print("LOCAL_AVATAR_DICTIONARY_FIELD_NOT_MAPPED")
+                  raise SystemExit(0)
+              dump_qwords("Local avatar start", local_avatar, 8)
+              player_dict = q(local_avatar + 0x1B0)
+              print(f"PLAYER_DICT_CANDIDATE={('0x%X' % player_dict) if player_dict is not None else 'UNMAPPED'}")
+              if not player_dict or read_va(player_dict + 0x28, 8) is None:
+                  print("PLAYER_DICT_HEADER_NOT_MAPPED")
+                  raise SystemExit(0)
+
+              def inspect_dict(label, dict_ptr, slot_decimal=None):
+                  used = q(dict_ptr + 0x18)
+                  mask = q(dict_ptr + 0x20)
+                  table = q(dict_ptr + 0x28)
+                  print(f"{label}: ptr=0x{dict_ptr:X} used={used} mask={mask} table={('0x%X' % table) if table is not None else 'UNMAPPED'}")
+                  if used is None or mask is None or table is None or mask > 0xFFFF or table == 0:
+                      print(f"{label}: invalid or unverified dictionary header")
+                      return None
+                  if read_va(table, min((mask + 1) * 24, 0x100000)) is None:
+                      print(f"{label}: table is not fully readable in one range or has unverified bounds")
+                  table_bytes = read_va(table, (mask + 1) * 24)
+                  if table_bytes is None:
+                      print(f"{label}: full table read failed")
+                      return None
+                  active = []
+                  for i in range(mask + 1):
+                      h, key_ptr, value_ptr = struct.unpack_from("<QQQ", table_bytes, i * 24)
+                      if key_ptr and value_ptr:
+                          active.append((i, h, key_ptr, value_ptr))
+                  unique_values = len({e[3] for e in active})
+                  print(f"{label}: occupiedKeyValueEntries={len(active)} uniqueValuePointers={unique_values} matchesUsed={len(active)==used}")
+                  if slot_decimal is not None:
+                      slot_va = table + slot_decimal * 24
+                      entry = read_va(slot_va, 24)
+                      print(f"{label}: decimalSlot={slot_decimal} byteOffset=0x{slot_decimal*24:X} entryVA=0x{slot_va:X}")
+                      if entry:
+                          h, key_ptr, value_ptr = struct.unpack("<QQQ", entry)
+                          print(f"{label}: slotHash=0x{h:X} keyPtr=0x{key_ptr:X} valuePtr=0x{value_ptr:X}")
+                          if key_ptr:
+                              kb = read_va(key_ptr, 0x60)
+                              print(f"{label}: slotKeyObjectBytes={kb.hex(' ') if kb else 'UNMAPPED'}")
+                              print(f"{label}: keyObjectContainsAvatarInAoI={bool(kb and (b'avatarInAoI' in kb or 'avatarInAoI'.encode('utf-16le') in kb))}")
+                          return value_ptr if value_ptr else None
+                  for i, h, kp, vp in active[:40]:
+                      print(f"  entry[{i}] hash=0x{h:X} key=0x{kp:X} value=0x{vp:X} valueMapped={'yes' if read_va(vp,8) else 'no'}")
+                  return None
+
+              print("=== PLAYER DICTIONARY ===")
+              aoi_dict = inspect_dict("PLAYER_DICT", player_dict, 770)
+              if aoi_dict and read_va(aoi_dict + 0x28, 8) is not None:
+                  print("=== AOI DICTIONARY CANDIDATE FROM DECIMAL SLOT 770 ===")
+                  inspect_dict("AOI_DICT", aoi_dict)
+              else:
+                  print("AOI_DICTIONARY_NOT_ESTABLISHED_FROM_SLOT_770")
+          PY
+
+          {
+            echo "Original dump SHA-256:"
+            cat work/dump-sha256.txt
+            echo
+            echo "Original dump size:"
+            cat work/dump-size.txt
+            echo
+            echo "Parts:"
+            cat work/dump-parts-manifest.txt
+          } > work/dump-parts-manifest-with-hashes.txt
 
       - name: Upload dump part 00
         uses: actions/upload-artifact@v4
@@ -126,10 +343,10 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
-      - name: Upload manifests and archive diagnostics
+      - name: Upload analysis reports
         uses: actions/upload-artifact@v4
         with:
-          name: ros64-dmp-manifests
+          name: ros64-dmp-analysis-reports
           path: |
             work/parts-manifest.txt
             work/original-volume-test.txt
@@ -137,6 +354,7 @@ jobs:
             work/extraction-test.txt
             work/dump-sha256.txt
             work/dump-size.txt
-            work/dump-parts-manifest.txt
+            work/dump-parts-manifest-with-hashes.txt
+            work/entity-discovery-memory-report.txt
           compression-level: 0
           if-no-files-found: error
