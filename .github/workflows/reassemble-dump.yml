@@ -311,6 +311,178 @@ jobs:
             cat work/dump-parts-manifest.txt
           } > work/dump-parts-manifest-with-hashes.txt
 
+      - name: Scan memory for live instances of the controlled avatar type
+        shell: bash
+        run: |
+          python3 - <<'PY' | tee work/entity-instance-scan.txt
+          import bisect, struct
+          from pathlib import Path
+
+          path = Path("work/extracted/ros64.dmp")
+          size = path.stat().st_size
+          regions = []
+          with path.open("rb") as f:
+              if f.read(4) != b"MDMP":
+                  raise SystemExit("INVALID_MINIDUMP_SIGNATURE")
+              f.seek(4)
+              version, count, directory_rva, checksum, timestamp = struct.unpack("<IIIII", f.read(20))
+              f.seek(directory_rva)
+              streams = {}
+              for _ in range(count):
+                  kind, data_size, rva = struct.unpack("<III", f.read(12))
+                  if rva + data_size <= size:
+                      streams.setdefault(kind, []).append((data_size, rva))
+              if 9 not in streams:
+                  raise SystemExit("NO_MEMORY64_LIST")
+              data_size, rva = streams[9][0]
+              f.seek(rva)
+              n, base_rva = struct.unpack("<QQ", f.read(16))
+              f.seek(rva + 16)
+              cursor = base_rva
+              for _ in range(n):
+                  va, length = struct.unpack("<QQ", f.read(16))
+                  if cursor + length <= size:
+                      regions.append((va, va + length, cursor, length))
+                  cursor += length
+          regions.sort(key=lambda x: x[0])
+          starts = [x[0] for x in regions]
+
+          def read_va(va, length):
+              i = bisect.bisect_right(starts, va) - 1
+              if i < 0:
+                  return None
+              start, end, fileoff, rlen = regions[i]
+              if va < start or va + length > end:
+                  return None
+              with path.open("rb") as f:
+                  f.seek(fileoff + va - start)
+                  b = f.read(length)
+              return b if len(b) == length else None
+
+          def q(va):
+              b = read_va(va, 8)
+              return struct.unpack("<Q", b)[0] if b else None
+
+          def u32(va):
+              b = read_va(va, 4)
+              return struct.unpack("<I", b)[0] if b else None
+
+          def f32(va):
+              b = read_va(va, 4)
+              return struct.unpack("<f", b)[0] if b else None
+
+          def dict_info(obj):
+              dp = q(obj + 0x1B0)
+              if not dp or read_va(dp + 0x28, 8) is None:
+                  return None
+              used, mask, table = q(dp+0x18), q(dp+0x20), q(dp+0x28)
+              if used is None or mask is None or table is None or mask > 0xFFFF or used > mask + 1 or not table:
+                  return None
+              if read_va(table, 24) is None:
+                  return None
+              return dp, used, mask, table
+
+          em = q(0x1431F53D8)
+          if em is None:
+              raise SystemExit("ENTITY_MANAGER_POINTER_SLOT_UNMAPPED")
+          controlled = q(em + 0x10F8)
+          tree_candidate = q(controlled + 0x8) if controlled else None
+          avatar = q(tree_candidate + 0x20) if tree_candidate else None
+          type_ptr = q(avatar + 0x8) if avatar else None
+
+          print(f"DUMP_TIMESTAMP_UTC={__import__('datetime').datetime.fromtimestamp(timestamp, __import__('datetime').timezone.utc).isoformat()}")
+          print(f"EM=0x{em:X} controlledContainer={('0x%X'%controlled) if controlled else 'UNMAPPED'} treeCandidate={('0x%X'%tree_candidate) if tree_candidate else 'UNMAPPED'} localAvatar={('0x%X'%avatar) if avatar else 'UNMAPPED'} typePointer={('0x%X'%type_ptr) if type_ptr else 'UNMAPPED'}")
+          print("=== GLOBAL TREE CANDIDATE ===")
+          for offset in range(0, 0x60, 8):
+              val = q(0x17A727E0 + offset)
+              print(f"0x17A727E0+0x{offset:02X} = {('0x%016X'%val) if val is not None else 'UNMAPPED'}")
+          print("=== CONTROLLED CONTAINER ===")
+          if controlled:
+              for offset in range(0, 0x80, 8):
+                  val = q(controlled + offset)
+                  print(f"0x{controlled:X}+0x{offset:02X} = {('0x%016X'%val) if val is not None else 'UNMAPPED'}")
+
+          if not type_ptr or read_va(type_ptr + 0x18, 8) is None:
+              raise SystemExit("LOCAL_AVATAR_TYPE_LAYOUT_UNVERIFIED")
+          name_ptr = q(type_ptr + 0x18)
+          name_raw = read_va(name_ptr, 128) if name_ptr else None
+          name = name_raw.split(b"\0", 1)[0].decode("ascii", "replace") if name_raw else "UNREADABLE"
+          print(f"PYTYPE=0x{type_ptr:X} tp_name_ptr={('0x%X'%name_ptr) if name_ptr else 'UNMAPPED'} tp_name={name}")
+          print(f"LOCAL_AVATAR_REFCOUNT={q(avatar)} entityIdDwordAt+0x18={('0x%08X'%u32(avatar+0x18)) if u32(avatar+0x18) is not None else 'UNMAPPED'} dict={dict_info(avatar)}")
+
+          # Enumerate AOI dictionary slots by verified value type, not by nonzero bytes alone.
+          player_dict = q(avatar + 0x1B0) if avatar else None
+          aoi = None
+          if player_dict:
+              used, mask, table = q(player_dict+0x18), q(player_dict+0x20), q(player_dict+0x28)
+              if mask is not None and mask <= 0xFFFF and table:
+                  entry = read_va(table + 770 * 24, 24)
+                  if entry:
+                      _, key_ptr, aoi_candidate = struct.unpack("<QQQ", entry)
+                      kraw = read_va(key_ptr, 64) if key_ptr else None
+                      if kraw and b"avatarInAoI" in kraw:
+                          aoi = aoi_candidate
+          aoi_matches = []
+          if aoi:
+              a_used, a_mask, a_table = q(aoi+0x18), q(aoi+0x20), q(aoi+0x28)
+              print(f"AOI_DICT=0x{aoi:X} used={a_used} mask={a_mask} table={('0x%X'%a_table) if a_table else 'UNMAPPED'}")
+              if a_mask is not None and a_mask <= 0xFFFF and a_table:
+                  for i in range(a_mask + 1):
+                      row = read_va(a_table + i*24, 24)
+                      if not row:
+                          continue
+                      h, kp, vp = struct.unpack("<QQQ", row)
+                      if vp and q(vp+8) == type_ptr:
+                          info = dict_info(vp)
+                          eid = u32(vp+0x18)
+                          aoi_matches.append((i,h,kp,vp,eid,info))
+              print(f"AOI_typeMatches={len(aoi_matches)} uniquePointers={len({x[3] for x in aoi_matches})} uniqueIds={len({x[4] for x in aoi_matches if x[4] is not None})}")
+              for entry in aoi_matches:
+                  i,h,kp,vp,eid,info=entry
+                  print(f"AOI_SLOT={i} hash=0x{h:X} key=0x{kp:X} avatar=0x{vp:X} id=0x{eid:08X} dict={info}")
+          else:
+              print("AOI_DICT_NOT_RESOLVED_FROM_VERIFIED_SLOT_770")
+
+          # Search every captured memory range for the exact PyObject.ob_type pointer at object+8.
+          # Candidates are retained only when refcount, entity id, and an instance dictionary header agree.
+          pattern = struct.pack("<Q", type_ptr)
+          candidates = {}
+          block_size = 16 * 1024 * 1024
+          with path.open("rb") as f:
+              for va_start, va_end, fileoff, length in regions:
+                  offset = 0
+                  overlap = b""
+                  while offset < length:
+                      take = min(block_size, length - offset)
+                      f.seek(fileoff + offset)
+                      data = f.read(take)
+                      if not data:
+                          break
+                      combined = overlap + data
+                      combined_va = va_start + offset - len(overlap)
+                      pos = combined.find(pattern)
+                      while pos >= 0:
+                          type_va = combined_va + pos
+                          object_va = type_va - 8
+                          if object_va >= va_start and object_va + 0x1B8 <= va_end:
+                              refcnt = q(object_va)
+                              eid = u32(object_va + 0x18)
+                              info = dict_info(object_va)
+                              if refcnt is not None and 0 < refcnt <= 1_000_000 and eid not in (None, 0) and info:
+                                  candidates[object_va] = (refcnt, eid, info)
+                          pos = combined.find(pattern, pos + 1)
+                      overlap = combined[-7:] if len(combined) >= 7 else combined
+                      offset += take
+          # Keep only the first 256 records in text output; summary counts use all verified records.
+          unique_ids = {record[1] for record in candidates.values()}
+          print("=== GLOBAL INSTANCE CENSUS ===")
+          print(f"exactTypePointerHitsWithPlausibleObjectAndDict={len(candidates)} uniqueEntityIds={len(unique_ids)}")
+          print(f"AOI_pointerCount={len({x[3] for x in aoi_matches}) if aoi else 0} globalPointersOutsideAOI={len(set(candidates)-{x[3] for x in aoi_matches})}")
+          for obj,(refcnt,eid,info) in sorted(candidates.items())[:256]:
+              x,y,z = f32(obj+0x1C), f32(obj+0x20), f32(obj+0x24)
+              print(f"AVATAR_INSTANCE ptr=0x{obj:X} refcnt={refcnt} id=0x{eid:08X} xyzCandidate=({x},{y},{z}) dict={info}")
+          PY
+
       - name: Upload dump part 00
         uses: actions/upload-artifact@v4
         with:
@@ -356,5 +528,6 @@ jobs:
             work/dump-size.txt
             work/dump-parts-manifest-with-hashes.txt
             work/entity-discovery-memory-report.txt
+            work/entity-instance-scan.txt
           compression-level: 0
           if-no-files-found: error
